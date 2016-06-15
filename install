@@ -1,0 +1,6 @@
+#! /usr/bin/env bash
+set -eo pipefail; [[ $TRACE ]] && set -x
+
+git clone https://github.com/atn9/dokku-client-wrapper.git ~/.dokku-client-wrapper
+echo 'Add to following to either your .bashrc .bash_profile or .profile:'
+echo "  alias dokku='\$HOME/.dokku-client-wrapper/client'"

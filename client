@@ -1,0 +1,216 @@
+#! /usr/bin/env bash
+set -eo pipefail; [[ $TRACE ]] && set -x
+
+usage() {
+  echo 'Wrapper client for dokku'
+  echo
+  echo 'Usage: dokku [options] <command>'
+  echo
+  echo 'Wrapper options:'
+  echo '    --help | -h'
+  echo '    --remote=<remote>'
+  echo '    --envfile=</path/to/env/file>'
+  echo
+  echo 'Wrapper commands:'
+  echo '    envfile:   Update remote configurations from a local environment file'
+  echo '    install:   Update remote conf from env file and install this app'
+  echo '    <command>  All other commands are passed to dokku'
+
+  echo
+  echo 'Remote branch configuration example:'
+  echo '    git remote add prod dokku@dokku.me:appname'
+  echo '    git config remote.prod.envfile /path/to/env/file'
+  echo '    git config dokku.remote prod'
+}
+
+error() {
+  echo "=> Error: $1"
+  echo
+  echo "Type 'dokku -h' for more info"
+  exit 1
+}
+
+require_host_and_app() {
+  # Extract DOKKU_HOST and DOKKU_APP from the git remote branch if they are
+  # not already set
+  if [[ -z "$DOKKU_HOST" ]] || [[ -z "$DOKKU_APP" ]]; then
+
+    [[ -z $REMOTE ]] && REMOTE=$(git config dokku.remote || true)
+    [[ -z $REMOTE ]] && REMOTE=dokku
+    remote_line=$(git remote -v | grep -Ei "^$REMOTE" || true)
+
+    if [[ -n $remote_line ]]; then
+      remote_info=$(echo "$remote_line" | head -n 1 | cut -f1 -d' ')
+      if [[ -z "$DOKKU_HOST" ]]; then
+        DOKKU_HOST=$(echo "$remote_info" | cut -f2 -d '@' | cut -f1 -d ':')
+      fi
+      if [[ -z "$DOKKU_APP" ]]; then
+        DOKKU_APP=$(echo "$remote_info" | cut -f2 -d '@' | cut -f2 -d ':')
+      fi
+    else
+      error "No git remote branch named '$REMOTE' are configured. Check your git configurations."
+    fi
+  fi
+}
+
+require_envfile() {
+  if [[ -z $ENVFILE ]]; then
+    ENVFILE=$(git config remote."$REMOTE".envfile || true)
+  fi
+  if [[ -z $ENVFILE ]]; then
+    error "An environment file is required to execute this command."
+  fi
+  if [[ ! -f $ENVFILE ]]; then
+    error "Environment file not found: $ENVFILE"
+  fi
+}
+
+dokku(){
+  # Use ssh to execute dokku commands on the the host
+  # https://github.com/dokku/dokku/blob/master/contrib/dokku_client.sh
+  # shellcheck disable=SC2068,SC2086,SC2153
+  ssh -o LogLevel=QUIET -p ${DOKKU_PORT:-22} -t ${DOKKU_USER:-dokku}@$DOKKU_HOST -- --app $DOKKU_APP $@
+}
+
+config_from_envfile() {
+  echo "=> Configuring remote app '$DOKKU_APP' at '$DOKKU_HOST' from the environment file: $ENVFILE"
+  # Export each lines and set them as environment variable on the host.
+  # - optional `export` keyword
+  # - ignore line that starts with `#`
+  # - ignore empty lines
+  # - variable substitution is not supported
+  set -o allexport
+  # shellcheck disable=SC1090
+  source "$1"
+  set +o allexport
+
+  dokku config:set --no-restart "$(grep -v '^#' < "$1" | awk 'NF > 0'| sed -e "s/^export //" | sed -e 's/ /\\\ /g' | xargs)"
+}
+
+install() {
+  dokku apps:create "$DOKKU_APP" || true
+  config_from_envfile "$ENVFILE"
+
+  if [[ -x preinstall ]]; then
+     echo '=> Executing preinstall script'
+    ./preinstall
+  fi
+
+  # Keep logs in the journal
+  # `dokku logs` is still available
+  # logs are available on the host with:
+  #    journalctl CONTAINER_TAG=$DOKKU_APP
+  dokku docker-options:add deploy,run "--log-driver=journald"
+  dokku docker-options:add deploy,run "--log-opt tag=$DOKKU_APP"
+
+  # Set same timezone as the host:
+  dokku storage:mount /etc/localtime:/etc/localtime || true
+
+  for storage in $STORAGES; do
+    host_dir=$(echo "$storage" | cut -f1 -d ':')
+    container_dir=$(echo "$storage" | cut -f2 -d ':')
+    # http://dokku.viewdocs.io/dokku/dokku-storage/
+    dokku storage:mount "/var/lib/dokku/data/storage/$host_dir:/$container_dir" || true
+  done
+
+  for domain in $DOMAINS; do
+    if ! dokku domains | grep -q "^$domain"; then
+      dokku domains:add "$domain"
+    fi
+  done
+
+  if [[ -n $LETSENCRYPT ]]; then
+    dokku letsencrypt "$DOKKU_APP"
+  fi
+
+  for redirect in $REDIRECTS; do
+    from=$(echo "$redirect" | cut -f1 -d ':')
+    to=$(echo "$redirect" | cut -f2 -d ':')
+    dokku redirect:set "$DOKKU_APP" "$from" "$to" || true
+  done
+
+  for app in $REDIS_APP; do
+    dokku redis:create "$app" || true
+    dokku redis:link "$app" "$DOKKU_APP" || true
+  done
+
+  for app in $MEMCACHED_APP; do
+    dokku memcached:create "$app" || true
+    dokku memcached:link "$app" "$DOKKU_APP" || true
+  done
+
+  for app in $POSTGRES_APP; do
+    dokku postgres:create "$POSTGRES_APP" || true
+    dokku postgres:link "$POSTGRES_APP" "$DOKKU_APP" || true
+  done
+
+  for app in $MYSQL_APP; do
+    dokku mysql:create "$MYSQL_APP" || true
+    dokku mysql:link "$MYSQL_APP" "$DOKKU_APP" || true
+  done
+
+  if [[ -x postinstall ]]; then
+     echo '=> Executing postinstall script'
+    ./postinstall
+  fi
+
+  echo '=> Installation completed with success!'
+}
+
+# Options
+# http://unix.stackexchange.com/questions/258512/how-to-remove-a-positional-parameter-from
+for opt in "$@"; do
+  shift
+  case $opt in
+    --remote=*)
+      REMOTE=$(echo $opt | cut -f 2 -d =)
+      ;;
+    --envfile=*)
+      ENVFILE=$(echo $opt | cut -f 2 -d =)
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --)
+      break
+      ;;
+    *)
+      set -- "$@" "$opt"
+      ;;
+  esac
+done
+
+# Commands
+case $1 in
+  envfile)
+    require_host_and_app
+    require_envfile
+
+    echo "Configuring app '$DOKKU_APP' at '$DOKKU_HOST' with data from environment file at $ENVFILE"
+    read -p "Continue? [yn]" -n 1 -r
+    echo    # (optional) move to a new line
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      config_from_envfile "$ENVFILE"
+    else
+      echo 'Canceled'
+    fi
+    ;;
+  install)
+    require_host_and_app
+    require_envfile
+
+    echo "Configuring and installing app '$DOKKU_APP' at '$DOKKU_HOST' with data from environment file at $ENVFILE"
+    read -p "Continue? [yn]" -n 1 -r
+    echo    # (optional) move to a new line
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      install
+    else
+      echo 'Canceled'
+    fi
+    ;;
+  *)
+    require_host_and_app
+    dokku "${@:1}"
+    ;;
+esac
